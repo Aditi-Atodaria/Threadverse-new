@@ -16,6 +16,8 @@ load_dotenv()
 
 API_KEY = os.getenv("API_KEY") or os.getenv("GROQ_API_KEY")
 _groq_client = Groq(api_key=API_KEY) if API_KEY else None
+# llama-3.3-70b-versatile was shut down by Groq on 16 Aug 2026. Override with GROQ_MODEL in .env if needed.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 app = Flask(__name__)
 # Secure secret key — override via SECRET_KEY env variable in production
@@ -1012,38 +1014,45 @@ def api_chat():
 
     filtered, cat, color, gender = _rag_filter(user_msg)
 
-    try:
-        if _groq_client is None:
-            raise RuntimeError("api_key missing: set API_KEY in your .env file")
-        prompt   = _rag_prompt(user_msg, filtered, history)
-        response = _groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role":"user","content":prompt}],
-            max_tokens=300
-        )
-        bot_text = response.choices[0].message.content.strip()
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        err = str(e).lower()
-        if "api_key" in err or "authentication" in err or "unauthorized" in err:
-            bot_text = "❌ Invalid API key — check API_KEY in your .env file."
-        elif "rate" in err or "limit" in err:
-            bot_text = "⏳ Rate limit reached — please wait a moment."
-        elif "connect" in err or "network" in err or "timeout" in err:
-            bot_text = "❌ Network error — check your connection."
-        else:
-            bot_text = f"❌ Error: {e}"
+    is_greeting = bool(re.search(
+        r"\b(hi|hello|hey|good morning|good afternoon|good evening|thanks|thank you)\b",
+        user_msg.lower()))
+
+    # A plain greeting ("hi", "thanks") should just get a reply, not a random product grid.
+    if is_greeting and not (cat or color or gender):
         filtered = []
 
-    greeting_words = ["hi","hello","hey","good morning","good afternoon","thanks","thank you"]
-    is_greeting    = any(w in user_msg.lower() for w in greeting_words)
+    # Ask the LLM for a short intro. If it is unavailable or fails, fall back to a
+    # simple reply so the product search still works (products come from _rag_filter, not the LLM).
+    bot_text = ""
+    if _groq_client is not None:
+        try:
+            prompt = _rag_prompt(user_msg, filtered, history)
+            kwargs = dict(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=400,
+            )
+            if "gpt-oss" in GROQ_MODEL:
+                kwargs["reasoning_effort"] = "low"
+            response = _groq_client.chat.completions.create(**kwargs)
+            bot_text = (response.choices[0].message.content or "").strip()
+        except Exception:
+            app.logger.exception("Groq chat request failed")
+
+    if not bot_text:
+        if is_greeting:
+            bot_text = "Hi! I'm ThreadVerse AI. Tell me what you're looking for, like a colour, category or budget."
+        elif filtered:
+            bot_text = "Here are some great options for you!"
+
     no_results     = not filtered and not is_greeting
     products_to_show = sorted(filtered, key=lambda x: x.get('rating',0), reverse=True)[:8] if filtered else []
 
     if no_results:
         cat_label = _CAT_DISPLAY.get(cat, cat.capitalize()) if cat else None
         bot_text = (
-            f"🔍 Couldn't find an exact match. Explore our full <strong>{cat_label}</strong> collection?"
+            f"🔍 Couldn't find an exact match. Explore our full {cat_label} collection?"
             if cat_label else
             "🔍 Couldn't find an exact match. Try a different category or colour?"
         )
