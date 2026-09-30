@@ -11,9 +11,11 @@ import qrcode
 from werkzeug.utils import secure_filename
 
 # ── GROQ SETUP ────────────────────────────────────────────────────────────────
-import os
+from dotenv import load_dotenv
+load_dotenv()
 
-API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("API_KEY") or os.getenv("GROQ_API_KEY")
+_groq_client = Groq(api_key=API_KEY) if API_KEY else None
 
 app = Flask(__name__)
 # Secure secret key — override via SECRET_KEY env variable in production
@@ -161,6 +163,17 @@ def customer_required(f):
         return f(*args, **kwargs)
     return decorated
 
+def shopper_optional(f):
+    """Public page: guests may browse. A logged-in demo vendor is still sent to their dashboard."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = current_user()
+        if user and is_demo_vendor(user['id']):
+            flash('This demo account is for selling only.', 'warning')
+            return redirect(url_for('vendor_dashboard'))
+        return f(*args, **kwargs)
+    return decorated
+
 # ── AUTH PAGES ────────────────────────────────────────────────────────────────
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -285,7 +298,7 @@ def send_otp():
 @app.route('/logout')
 def logout():
     session.clear()
-    return redirect(url_for('login'))
+    return redirect(url_for('home'))
 
 # ── VENDOR SETUP (for customers switching to vendor mode) ─────────────────────
 
@@ -341,8 +354,7 @@ def switch_mode():
 # ── CUSTOMER PAGES ────────────────────────────────────────────────────────────
 
 @app.route('/')
-@login_required
-@customer_required
+@shopper_optional
 def home():
     products   = db.get_products()
     featured   = products[:12]
@@ -358,8 +370,7 @@ def home():
     )
 
 @app.route('/shop')
-@login_required
-@customer_required
+@shopper_optional
 def shop():
     filters = {
         'q': request.args.get('q', '').strip(),
@@ -405,15 +416,13 @@ def shop():
     )
 
 @app.route('/chat')
-@login_required
-@customer_required
+@shopper_optional
 def chat():
     user = current_user()
     return render_template('chat.html', user=user)
 
 @app.route('/product/<int:product_id>')
-@login_required
-@customer_required
+@shopper_optional
 def product_detail(product_id):
     product = db.get_product(product_id)
     if not product:
@@ -423,8 +432,7 @@ def product_detail(product_id):
     return render_template('product.html', product=product, related=related, user=user)
 
 @app.route('/cart')
-@login_required
-@customer_required
+@shopper_optional
 def cart_page():
     cart  = db.get_cart(get_sid())
     total = sum(item['price'] * item.get('qty', 1) for item in cart)
@@ -508,8 +516,7 @@ def store_page(store_ref):
     )
 
 @app.route('/wishlist')
-@login_required
-@customer_required
+@shopper_optional
 def wishlist_page():
     wl   = db.get_wishlist(get_sid())
     user = current_user()
@@ -1006,6 +1013,8 @@ def api_chat():
     filtered, cat, color, gender = _rag_filter(user_msg)
 
     try:
+        if _groq_client is None:
+            raise RuntimeError("api_key missing: set API_KEY in your .env file")
         prompt   = _rag_prompt(user_msg, filtered, history)
         response = _groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -1017,7 +1026,7 @@ def api_chat():
         import traceback; traceback.print_exc()
         err = str(e).lower()
         if "api_key" in err or "authentication" in err or "unauthorized" in err:
-            bot_text = "❌ Invalid API key — check app.py line 8."
+            bot_text = "❌ Invalid API key — check API_KEY in your .env file."
         elif "rate" in err or "limit" in err:
             bot_text = "⏳ Rate limit reached — please wait a moment."
         elif "connect" in err or "network" in err or "timeout" in err:
@@ -1107,6 +1116,15 @@ def admin_cleanup_vendors():
     flash('Store deletion is disabled.', 'warning')
     return redirect(url_for('vendor_dashboard'))
 
+
+@app.errorhandler(500)
+def server_error(e):
+    app.logger.exception("500 error")
+    return render_template('500.html', user=current_user()), 500
+
+@app.errorhandler(404)
+def not_found(e):
+    return render_template('404.html', user=current_user()), 404
 
 # ── CONTEXT PROCESSOR ─────────────────────────────────────────────────────────
 
